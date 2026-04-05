@@ -19,12 +19,12 @@ import logging
 import os
 import shutil
 from dataclasses import dataclass, field, asdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import usb.core
 
-from open_gopro import WiredGoPro
+from open_gopro import WiredGoPro, WirelessGoPro
 from open_gopro.domain.exceptions import FailedToFindDevice
 
 
@@ -51,6 +51,7 @@ SKYGOD_DIR = OUTPUT_DIR / "skygodVideos"
 FFMPEG = "ffmpeg"
 VIDEO_EXTENSIONS = {".360", ".mp4"}
 N_PROCESS_WORKERS = 1
+COOLDOWN_HOURS = 2
 
 log = logging.getLogger(__name__)
 
@@ -69,7 +70,7 @@ class FileEntry:
 @dataclass
 class AppState:
     phase: str = "waiting"
-    # waiting      — polling ioreg for USB device
+    # waiting      — scanning for USB or Wi-Fi/BLE device
     # connecting   — SDK context open, before file list fetched
     # transferring — run_downloader active
     # processing   — downloader done, workers still running
@@ -1221,12 +1222,135 @@ async def _usb_watchdog(state: AppState, poll_interval: float = 2.0) -> None:
             raise UnexpectedDisconnect("Camera disconnected during transfer")
 
 
+async def _wireless_watchdog(gopro, state: AppState, poll_interval: float = 2.0) -> None:
+    """Raise UnexpectedDisconnect if BLE connection drops before downloads finish."""
+    while True:
+        await asyncio.sleep(poll_interval)
+        if state.phase in ("processing", "safe"):
+            return
+        if not gopro.is_ble_connected:
+            raise UnexpectedDisconnect("BLE connection lost during transfer")
+
+
+async def _discover_usb(serial: str | None, cooldowns: dict) -> tuple:
+    """Loop until a USB GoPro not in cooldown is found and connected. Returns (gopro, False)."""
+    while True:
+        if _has_gopro_usb():
+            try:
+                gopro = WiredGoPro(serial=serial)
+                await gopro.open()
+                cam_serial = gopro.identifier
+                expiry = cooldowns.get(cam_serial)
+                if expiry and datetime.now() < expiry:
+                    log.info("USB GoPro %s in cooldown until %s, ignoring.", cam_serial, expiry.strftime("%H:%M"))
+                    await gopro.close()
+                else:
+                    return gopro, False
+            except FailedToFindDevice:
+                pass
+            except Exception as e:
+                log.debug("USB connect error: %s", e)
+        await asyncio.sleep(2)
+
+
+async def _discover_wireless(cooldowns: dict) -> tuple:
+    """Scan for a wireless GoPro not in cooldown. Returns (gopro, True)."""
+    while True:
+        try:
+            gopro = WirelessGoPro(target=None)
+            await gopro.open(timeout=15, retries=1)
+            cam_serial = gopro.identifier
+            expiry = cooldowns.get(cam_serial)
+            if expiry and datetime.now() < expiry:
+                log.info("Wireless GoPro %s in cooldown until %s, ignoring.", cam_serial, expiry.strftime("%H:%M"))
+                try:
+                    await gopro.close()
+                except Exception:
+                    pass
+                await asyncio.sleep(30)
+            else:
+                return gopro, True
+        except FailedToFindDevice:
+            await asyncio.sleep(5)
+        except Exception as e:
+            log.debug("Wireless scan error: %s", e)
+            await asyncio.sleep(5)
+
+
+async def _race_discovery(serial: str | None, cooldowns: dict) -> tuple:
+    """Race USB and wireless discovery; return (gopro, is_wireless) for the winner."""
+    usb_task = asyncio.create_task(_discover_usb(serial, cooldowns))
+    ble_task = asyncio.create_task(_discover_wireless(cooldowns))
+    done, pending = await asyncio.wait([usb_task, ble_task], return_when=asyncio.FIRST_COMPLETED)
+    for t in pending:
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+    # If both completed simultaneously, close the extra connection
+    winner = None
+    for t in done:
+        if winner is None:
+            winner = t
+        else:
+            try:
+                extra_gopro, _ = t.result()
+                await extra_gopro.close()
+            except Exception:
+                pass
+    return winner.result()
+
+
+async def _run_session(gopro, is_wireless: bool, state: AppState, today_dir: Path) -> None:
+    """Execute a full transfer session with an already-connected gopro."""
+    state.camera_serial = gopro.identifier
+    name_resp = await gopro.http_command.get_camera_name()
+    info_resp = await gopro.http_command.get_camera_info()
+    state.camera_model = (info_resp.data.model_name if info_resp.ok else None)
+    state.camera_name = (name_resp.data if name_resp.ok else None)
+    push_event(state)
+    _write_session_file(today_dir, state)
+    log.info("Connected: %s (%s) via %s", state.camera_model, state.camera_serial,
+             "Wi-Fi/BLE" if is_wireless else "USB")
+
+    files = await get_todays_files(gopro, today_dir, state.camera_serial)
+    if not files:
+        log.info("No new video files from today. Nothing to do.")
+        state.phase = "safe"
+        push_event(state)
+        return
+
+    state.phase = "transferring"
+    state.files = [FileEntry(filename=Path(item.filename).name) for item in files]
+    push_event(state)
+    log.info("Starting parallel download + processing (%d file(s))...", len(files))
+
+    queue: asyncio.Queue = asyncio.Queue()
+    watchdog = _wireless_watchdog(gopro, state) if is_wireless else _usb_watchdog(state)
+    try:
+        await asyncio.gather(
+            run_downloader(gopro, files, queue, RAW_DIR, state),
+            run_processor(queue, today_dir, n_workers=N_PROCESS_WORKERS, state=state, today_dir=today_dir, serial=state.camera_serial),
+            watchdog,
+        )
+        state.phase = "safe"
+        push_event(state)
+        log.info("All done. Processed videos: %s", today_dir)
+    except UnexpectedDisconnect:
+        log.warning("Camera disconnected unexpectedly — aborting and cleaning up raw files.")
+        _cleanup_raw_dir()
+        state.phase = "error"
+        push_event(state)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-async def main(state: AppState, serial: str | None) -> None:
+async def main(state: AppState, serial: str | None, wireless: bool) -> None:
     ensure_dirs()
+    cooldowns: dict[str, datetime] = {}
 
     while True:
         try:
@@ -1240,49 +1364,30 @@ async def main(state: AppState, serial: str | None) -> None:
             state.files = []
             refresh_today_stats(state, today_dir)
             push_event(state)
-            log.info("Connecting to GoPro via USB%s...", f" (serial: {serial})" if serial else "")
 
-            async with WiredGoPro(serial=serial) as gopro:
-                state.camera_serial = gopro.identifier
-                name_resp = await gopro.http_command.get_camera_name()
-                info_resp = await gopro.http_command.get_camera_info()
-                state.camera_model = (info_resp.data.model_name if info_resp.ok else None)
-                state.camera_name = (name_resp.data if name_resp.ok else None)
-                push_event(state)
-                _write_session_file(today_dir, state)
-                log.info("Connected: %s (%s)", state.camera_model, state.camera_serial)
-
-                files = await get_todays_files(gopro, today_dir, state.camera_serial)
-                if not files:
-                    log.info("No new video files from today. Nothing to do.")
-                    state.phase = "safe"
-                    push_event(state)
-                else:
-                    state.phase = "transferring"
-                    state.files = [
-                        FileEntry(filename=Path(item.filename).name)
-                        for item in files
-                    ]
-                    push_event(state)
-
-                    log.info("Starting parallel download + processing (%d file(s))...", len(files))
-                    queue: asyncio.Queue = asyncio.Queue()
+            if wireless:
+                log.info("Scanning for GoPro over USB and Wi-Fi/BLE...")
+                gopro, is_wireless_conn = await _race_discovery(serial, cooldowns)
+                try:
+                    await _run_session(gopro, is_wireless_conn, state, today_dir)
+                finally:
                     try:
-                        await asyncio.gather(
-                            run_downloader(gopro, files, queue, RAW_DIR, state),
-                            run_processor(queue, today_dir, n_workers=N_PROCESS_WORKERS, state=state, today_dir=today_dir, serial=state.camera_serial),
-                            _usb_watchdog(state),
-                        )
-                        state.phase = "safe"
-                        push_event(state)
-                        log.info("All done. Processed videos: %s", today_dir)
-                    except UnexpectedDisconnect:
-                        log.warning("Camera disconnected unexpectedly — aborting and cleaning up raw files.")
-                        _cleanup_raw_dir()
-                        state.phase = "error"
-                        push_event(state)
+                        await gopro.close()
+                    except Exception:
+                        pass
+                    if state.camera_serial:
+                        expiry = datetime.now() + timedelta(hours=COOLDOWN_HOURS)
+                        cooldowns[state.camera_serial] = expiry
+                        log.info("Camera %s in cooldown until %s.", state.camera_serial, expiry.strftime("%H:%M"))
+                if not is_wireless_conn:
+                    await wait_for_usb_gopro_disconnect()
+            else:
+                log.info("Connecting to GoPro via USB%s...", f" (serial: {serial})" if serial else "")
+                await wait_for_usb_gopro()
+                async with WiredGoPro(serial=serial) as gopro:
+                    await _run_session(gopro, False, state, today_dir)
+                await wait_for_usb_gopro_disconnect()
 
-            await wait_for_usb_gopro_disconnect()
             _cleanup_raw_dir()
             state.phase = "waiting"
             state.camera_serial = None
@@ -1290,25 +1395,33 @@ async def main(state: AppState, serial: str | None) -> None:
             state.camera_model = None
             state.files = []
             push_event(state)
-            await wait_for_usb_gopro()
+
+            if not wireless:
+                await wait_for_usb_gopro()
+
         except FailedToFindDevice:
-            log.info("Camera not found, waiting for USB connection...")
+            log.info("Camera not found, retrying...")
             state.phase = "waiting"
             push_event(state)
-            await wait_for_usb_gopro()
+            if not wireless:
+                await wait_for_usb_gopro()
         except Exception as e:
             log.error("Unexpected error: %s", e)
             state.phase = "error"
             push_event(state)
-            await wait_for_usb_gopro_disconnect()
-            await wait_for_usb_gopro()
+            _cleanup_raw_dir()
+            if not wireless:
+                await wait_for_usb_gopro_disconnect()
+                await wait_for_usb_gopro()
+            else:
+                await asyncio.sleep(5)
 
 
 async def entrypoint(args: argparse.Namespace) -> None:
     state = AppState()
     server_task = asyncio.create_task(run_web_server(state, port=8080))
     try:
-        await main(state, args.serial)
+        await main(state, args.serial, args.wireless)
     finally:
         server_task.cancel()
         await asyncio.gather(server_task, return_exceptions=True)
@@ -1321,6 +1434,11 @@ if __name__ == "__main__":
         metavar="XXXX",
         default=None,
         help="Serial number suffix for the camera (auto-discovers if omitted)",
+    )
+    parser.add_argument(
+        "--wireless",
+        action="store_true",
+        help="Also scan for GoPro cameras over Wi-Fi/BLE (requires prior manual BLE pairing)",
     )
     parser.add_argument(
         "--verbose", "-v",
