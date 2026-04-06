@@ -22,6 +22,8 @@ from dataclasses import dataclass, field, asdict
 from datetime import date, datetime
 from pathlib import Path
 
+import usb.core
+
 from open_gopro import WiredGoPro
 from open_gopro.domain.exceptions import FailedToFindDevice
 
@@ -1165,32 +1167,29 @@ async def run_processor(
 # USB device detection
 # ---------------------------------------------------------------------------
 
-async def _ioreg_has_gopro() -> bool:
+GOPRO_USB_VENDOR_ID = 0x2672
+
+
+def _has_gopro_usb() -> bool:
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "ioreg", "-r", "-c", "IOUSBHostDevice", "-l", "-w0",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        stdout, _ = await proc.communicate()
-        return b"GoPro" in stdout
+        return usb.core.find(idVendor=GOPRO_USB_VENDOR_ID) is not None
     except Exception as e:
-        log.debug("ioreg check failed: %s", e)
+        log.debug("USB check failed: %s", e)
         return False
 
 
 async def wait_for_usb_gopro_disconnect(poll_interval: float = 2.0) -> None:
-    """Block until no GoPro USB device is present in the IORegistry."""
+    """Block until no GoPro USB device is present."""
     log.info("Waiting for GoPro to disconnect... (Ctrl+C to stop)")
-    while await _ioreg_has_gopro():
+    while _has_gopro_usb():
         await asyncio.sleep(poll_interval)
     log.info("GoPro disconnected.")
 
 
 async def wait_for_usb_gopro(poll_interval: float = 2.0) -> None:
-    """Block until a GoPro USB device appears in the IORegistry."""
+    """Block until a GoPro USB device appears."""
     log.info("Waiting for GoPro USB connection... (Ctrl+C to stop)")
-    while not await _ioreg_has_gopro():
+    while not _has_gopro_usb():
         await asyncio.sleep(poll_interval)
     log.info("GoPro USB device detected.")
 
@@ -1218,7 +1217,7 @@ async def _usb_watchdog(state: AppState, poll_interval: float = 2.0) -> None:
         await asyncio.sleep(poll_interval)
         if state.phase in ("processing", "safe"):
             return
-        if not await _ioreg_has_gopro():
+        if not _has_gopro_usb():
             raise UnexpectedDisconnect("Camera disconnected during transfer")
 
 
