@@ -4,7 +4,7 @@
 Supports both GoPro Max (360) and regular GoPros (MP4).
 
 Usage:
-    python transfer_360.py [--serial XXXX] [--verbose]
+    python transfer_360.py [--verbose]
 
 Requirements:
     - open_gopro installed (pip install open-gopro)
@@ -19,19 +19,55 @@ import logging
 import os
 import shutil
 from dataclasses import dataclass, field, asdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import usb.core
 
-from open_gopro import WiredGoPro
+from open_gopro import WiredGoPro, WirelessGoPro
 from open_gopro.domain.exceptions import FailedToFindDevice
+from open_gopro.network.wifi.controller import SsidState, WifiController
+from returns.result import Failure
+import open_gopro.gopro_base as _gopro_base
+import aiohttp.web
 
 
 class UnexpectedDisconnect(Exception):
     """Raised by the USB watchdog when the camera disappears mid-transfer."""
-import open_gopro.gopro_base as _gopro_base
-import aiohttp.web
+
+
+class _NoopWifiController(WifiController):
+    """Stub WiFi controller used when connecting via COHN (no WiFi AP needed).
+
+    The real NetworksetupWireless runs macOS CLI tools like `system_profiler
+    SPAirPortDataType` synchronously, which blocks the asyncio event loop for
+    2-5 seconds. Since we only use BLE+COHN (never WiFi AP mode), the controller
+    is never actually used — but open_gopro still instantiates and queries it.
+    This stub returns sensible no-op values without running any subprocesses.
+    """
+
+    def __init__(self, interface: str | None = None, password: str | None = None) -> None:
+        super().__init__(interface, password)
+        self._interface = interface or "en0"
+
+    def available_interfaces(self) -> list[str]:
+        return [self._interface]
+
+    async def connect(self, ssid: str, password: str, timeout: float = 15) -> bool:
+        return False
+
+    async def disconnect(self) -> bool:
+        return True
+
+    def current(self) -> tuple[str | None, SsidState]:
+        return (None, SsidState.DISCONNECTED)
+
+    @property
+    def is_on(self) -> bool:
+        return True
+
+    def power(self, power: bool) -> bool:
+        return True
 
 # The default HTTP timeout of 5 s is too short for cameras that are slow to respond on connect
 # or for large file transfers over USB. Raise it for all HTTP operations.
@@ -43,6 +79,7 @@ for _method_name in ("_get_json", "_get_stream", "_put_json"):
     if _fn and _fn.__kwdefaults__:
         _fn.__kwdefaults__["timeout"] = _HTTP_TIMEOUT
 
+
 OUTPUT_DIR = Path.home() / "Movies" / "GoPro360"
 RAW_DIR = OUTPUT_DIR / "raw"
 PROCESSED_DIR = OUTPUT_DIR / "processed"
@@ -51,6 +88,10 @@ SKYGOD_DIR = OUTPUT_DIR / "skygodVideos"
 FFMPEG = "ffmpeg"
 VIDEO_EXTENSIONS = {".360", ".mp4"}
 N_PROCESS_WORKERS = 1
+COOLDOWN_HOURS = 2
+
+COHN_DB = Path.home() / ".config" / "gopro-transfer" / "cohn.db"
+CAMERAS_REGISTRY = Path.home() / ".config" / "gopro-transfer" / "cameras.json"
 
 log = logging.getLogger(__name__)
 
@@ -69,12 +110,14 @@ class FileEntry:
 @dataclass
 class AppState:
     phase: str = "waiting"
-    # waiting      — polling ioreg for USB device
+    # waiting      — scanning for USB or Wi-Fi/BLE device
     # connecting   — SDK context open, before file list fetched
     # transferring — run_downloader active
     # processing   — downloader done, workers still running
-    # safe         — everything done, safe to unplug
+    # safe         — everything done, safe to unplug/disconnect
     # error        — unexpected error this cycle
+
+    connection_type: str | None = None   # "usb" | "cohn" | None
 
     camera_serial: str | None = None
     camera_name: str | None = None
@@ -82,6 +125,9 @@ class AppState:
     files: list = field(default_factory=list)   # list[FileEntry]
     files_today_count: int = 0
     files_today_size_mb: float = 0.0
+
+    # Cooldown map: serial → datetime when camera becomes available again
+    cooldowns: dict = field(default_factory=dict)
 
     # SSE subscriber queues — excluded from JSON serialisation
     _sse_queues: list = field(default_factory=list)
@@ -97,6 +143,7 @@ class AppState:
 def _state_to_json(state: AppState) -> str:
     return json.dumps({
         "phase": state.phase,
+        "connection_type": state.connection_type,
         "camera_serial": state.camera_serial,
         "camera_name": state.camera_name,
         "camera_model": state.camera_model,
@@ -284,17 +331,18 @@ HTML_PAGE = """<!DOCTYPE html>
 </head>
 <body>
 <div class="wrap">
-  <div id="player-section">
-    <video id="player" autoplay muted playsinline></video>
-  </div>
-
   <header>
     <h1>GoPro Transfer</h1>
     <div style="display:flex;align-items:center;gap:16px">
       <span id="phase-badge" class="badge">waiting</span>
       <a href="/clips" style="font-size:13px;color:var(--muted);text-decoration:none">Clips ›</a>
+      <a href="/cameras" style="font-size:13px;color:var(--muted);text-decoration:none">Cameras ›</a>
     </div>
   </header>
+
+  <div id="player-section">
+    <video id="player" autoplay muted playsinline></video>
+  </div>
 
   <div id="safe-banner">&#10003;&nbsp; Safe to unplug camera</div>
 
@@ -336,9 +384,14 @@ function render(s) {
   if (s.phase === 'safe' || s.phase === 'processing') {
     banner.style.display = 'block';
     const noFiles = s.files.length === 0;
-    banner.textContent = noFiles
-      ? '\u2139\ufe0f  No new videos found \u00b7 Safe to unplug'
-      : '\u2713  Safe to unplug camera';
+    const isCohn = s.connection_type === 'cohn';
+    if (noFiles) {
+      banner.textContent = '\u2139\ufe0f  No new videos found \u00b7 Safe to ' + (isCohn ? 'disconnect' : 'unplug');
+    } else if (s.phase === 'processing') {
+      banner.textContent = '\u2699\ufe0f  Processing\u2026 ' + (isCohn ? 'Camera can disconnect' : 'Safe to unplug camera');
+    } else {
+      banner.textContent = '\u2713  ' + (isCohn ? 'All videos transferred' : 'Safe to unplug camera');
+    }
     banner.className = noFiles ? 'info' : '';
   } else {
     banner.style.display = 'none';
@@ -733,6 +786,239 @@ evtSrc.onerror = () => {};
 """
 
 
+CAMERAS_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cameras</title>
+<style>
+  :root {
+    --bg: #111; --surface: #1c1c1e; --border: #2c2c2e;
+    --text: #e5e5e7; --muted: #636366;
+    --blue: #0a84ff; --green: #30d158; --red: #ff453a; --grey: #48484a;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 15px; padding: 24px 16px;
+  }
+  .wrap { max-width: 680px; margin: 0 auto; }
+  header {
+    display: flex; align-items: center;
+    justify-content: space-between; margin-bottom: 20px;
+  }
+  h1 { font-size: 18px; font-weight: 600; letter-spacing: -.2px; }
+  a.nav { font-size: 13px; color: var(--muted); text-decoration: none; }
+  a.nav:hover { color: var(--text); }
+  .section-title {
+    font-size: 12px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .6px; color: var(--muted); margin-bottom: 10px;
+  }
+  #camera-list { display: flex; flex-direction: column; gap: 8px; }
+  .cam-row {
+    display: flex; align-items: center; gap: 12px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px 16px;
+  }
+  .cam-row.active { border-color: var(--green); }
+  .cam-info { flex: 1; display: flex; flex-direction: column; gap: 4px; }
+  .cam-serial { font-size: 14px; font-weight: 600; }
+  .cam-ip { font-size: 12px; color: var(--muted); font-family: "SF Mono","Fira Mono",monospace; }
+  .cam-status {
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .4px; padding: 2px 8px; border-radius: 20px;
+    background: var(--grey); color: #fff; white-space: nowrap;
+  }
+  .cam-status.connected { background: var(--green); color: #000; }
+  .cam-status.cooldown  { background: #ff9f0a; color: #000; }
+  .badge {
+    font-size: 12px; font-weight: 600; letter-spacing: .4px;
+    text-transform: uppercase; padding: 3px 10px;
+    border-radius: 20px; background: var(--grey); color: #fff;
+  }
+  .badge.phase-connecting   { background: var(--blue); }
+  .badge.phase-transferring,
+  .badge.phase-processing   { background: #ff9f0a; color: #000; }
+  .badge.phase-safe         { background: var(--green); color: #000; }
+  .badge.phase-error        { background: var(--red); }
+  .reset-btn {
+    background: none; border: 1px solid var(--border); border-radius: 8px;
+    color: #ff9f0a; font-size: 12px; font-weight: 600; padding: 6px 12px;
+    cursor: pointer; white-space: nowrap;
+  }
+  .reset-btn:hover { background: #ff9f0a; color: #000; border-color: #ff9f0a; }
+  .remove-btn {
+    background: none; border: 1px solid var(--border); border-radius: 8px;
+    color: var(--red); font-size: 12px; font-weight: 600; padding: 6px 12px;
+    cursor: pointer; white-space: nowrap;
+  }
+  .remove-btn:hover { background: var(--red); color: #fff; border-color: var(--red); }
+  #empty { color: var(--muted); font-size: 14px; padding: 12px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Cameras</h1>
+    <div style="display:flex;align-items:center;gap:16px">
+      <span id="phase-badge" class="badge">waiting</span>
+      <a href="/" class="nav">&#8249; Transfer</a>
+    </div>
+  </header>
+  <div class="section-title">Provisioned cameras</div>
+  <div id="camera-list"><p id="empty">No cameras provisioned yet.</p></div>
+</div>
+<script>
+const PHASE_LABELS = {
+  waiting: 'Waiting', connecting: 'Connecting',
+  transferring: 'Transferring', processing: 'Processing',
+  safe: 'Done', error: 'Error',
+};
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function setBadge(phase) {
+  const badge = document.getElementById('phase-badge');
+  badge.textContent = PHASE_LABELS[phase] || phase;
+  badge.className = 'badge phase-' + phase;
+}
+
+let _currentSerial = null;
+
+async function loadCameras(activeSerial) {
+  try {
+    const cameras = await fetch('/cameras/list').then(r => r.json());
+    const list = document.getElementById('camera-list');
+    if (!cameras.length) {
+      list.innerHTML = '<p id="empty">No cameras provisioned yet.</p>';
+      return;
+    }
+    list.innerHTML = cameras.map(c => {
+      const isActive = activeSerial && activeSerial === c.serial;
+      const displayName = c.camera_name || c.serial;
+      const types = (c.connection_types || []).join(', ').toUpperCase() || '—';
+      const meta = [c.model, c.serial, c.ip_address].filter(Boolean).join(' · ');
+      const lastSeen = c.last_seen ? 'Last seen ' + c.last_seen.replace('T', ' ') : '';
+      const cooldown = c.cooldown_until ? 'Next sync after ' + c.cooldown_until.replace('T', ' ') : '';
+      const onCooldown = !!c.cooldown_until && new Date(c.cooldown_until) > new Date();
+      return '<div class="cam-row' + (isActive ? ' active' : '') + '">' +
+        '<div class="cam-info">' +
+          '<span class="cam-serial">' + esc(displayName) + ' <span style="font-weight:400;color:var(--muted);font-size:12px">' + esc(types) + '</span></span>' +
+          '<span class="cam-ip">' + esc(meta) + '</span>' +
+          (lastSeen ? '<span class="cam-ip">' + esc(lastSeen) + '</span>' : '') +
+          (cooldown ? '<span class="cam-ip" style="color:' + (onCooldown ? '#ff9f0a' : 'var(--muted)') + '">' + esc(cooldown) + '</span>' : '') +
+        '</div>' +
+        '<span class="cam-status' + (isActive ? ' connected' : (onCooldown ? ' cooldown' : '')) + '">' +
+          (isActive ? 'Connected' : (onCooldown ? 'Cooldown' : 'Known')) + '</span>' +
+        (onCooldown ? '<button class="reset-btn" data-serial="' + esc(c.serial) + '" onclick="resetCooldown(this.dataset.serial)">Reset cooldown</button>' : '') +
+        '<button class="remove-btn" data-serial="' + esc(c.serial) + '" onclick="remove(this.dataset.serial)">Remove</button>' +
+      '</div>';
+    }).join('');
+  } catch(e) {}
+}
+
+async function resetCooldown(serial) {
+  await fetch('/cameras/cooldown/' + encodeURIComponent(serial), { method: 'DELETE' });
+  loadCameras(_currentSerial);
+}
+
+async function remove(serial) {
+  if (!confirm('Remove camera ' + serial + ' from the list?')) return;
+  await fetch('/cameras/remove/' + encodeURIComponent(serial), { method: 'DELETE' });
+  loadCameras(_currentSerial);
+}
+
+// Initial load
+fetch('/state').then(r => r.json()).then(s => {
+  setBadge(s.phase);
+  _currentSerial = s.camera_serial;
+  loadCameras(s.camera_serial);
+}).catch(() => {});
+
+// SSE: live badge + refresh cameras list when a new camera connects/disconnects
+const src = new EventSource('/events');
+src.onmessage = e => {
+  const s = JSON.parse(e.data);
+  setBadge(s.phase);
+  if (s.camera_serial !== _currentSerial) {
+    _currentSerial = s.camera_serial;
+    loadCameras(s.camera_serial);
+  }
+};
+src.onerror = () => {};
+</script>
+</body>
+</html>
+"""
+
+
+async def _cameras_list_handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    cameras = []
+    if CAMERAS_REGISTRY.exists():
+        try:
+            cameras = json.loads(CAMERAS_REGISTRY.read_text())
+        except Exception:
+            pass
+    # Enrich COHN cameras with IP address from the SDK DB.
+    if COHN_DB.exists():
+        try:
+            import tinydb
+            db = tinydb.TinyDB(COHN_DB)
+            for record in db.all():
+                full_serial = record.get("full_serial", "")
+                short_serial = record.get("serial", "")
+                ip = record.get("credentials", {}).get("ip_address", "")
+                for cam in cameras:
+                    if cam["serial"] == full_serial or cam["serial"].endswith(short_serial):
+                        cam["ip_address"] = ip
+                        break
+            db.close()
+        except Exception:
+            pass
+    # Enrich with cooldown expiry from live state.
+    state: AppState = request.app["state"]
+    for cam in cameras:
+        expiry = state.cooldowns.get(cam["serial"])
+        if expiry:
+            cam["cooldown_until"] = expiry.isoformat(timespec="seconds") if isinstance(expiry, datetime) else expiry
+    return aiohttp.web.json_response(cameras)
+
+
+async def _cameras_cooldown_reset_handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    serial = request.match_info["serial"]
+    state: AppState = request.app["state"]
+    state.cooldowns.pop(serial, None)
+    log.info("Cooldown reset for camera %s.", serial)
+    return aiohttp.web.Response(status=204)
+
+
+async def _cameras_remove_handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    serial = request.match_info["serial"]
+    # Remove from registry.
+    if CAMERAS_REGISTRY.exists():
+        try:
+            cameras = json.loads(CAMERAS_REGISTRY.read_text())
+            cameras = [c for c in cameras if c.get("serial") != serial]
+            CAMERAS_REGISTRY.write_text(json.dumps(cameras, indent=2))
+        except Exception:
+            pass
+    # Remove COHN credentials if present (match on full or short serial).
+    if COHN_DB.exists():
+        try:
+            import tinydb
+            db = tinydb.TinyDB(COHN_DB)
+            db.remove(tinydb.Query().serial.test(lambda s: serial.endswith(s) or s == serial))
+            db.close()
+        except Exception:
+            pass
+    log.info("Removed camera %s from registry.", serial)
+    return aiohttp.web.Response(status=204)
+
+
 async def _dates_handler(request: aiohttp.web.Request) -> aiohttp.web.Response:
     if not PROCESSED_DIR.exists():
         return aiohttp.web.json_response([])
@@ -775,6 +1061,29 @@ def _skygod_sidecar(src: Path) -> Path:
     return src.parent / f".{src.stem}.skygod"
 
 
+def _update_camera_registry(state: AppState) -> None:
+    """Upsert this camera into the persistent cameras registry."""
+    if not state.camera_serial:
+        return
+    CAMERAS_REGISTRY.parent.mkdir(parents=True, exist_ok=True)
+    cameras = []
+    if CAMERAS_REGISTRY.exists():
+        try:
+            cameras = json.loads(CAMERAS_REGISTRY.read_text())
+        except Exception:
+            pass
+    entry = next((c for c in cameras if c.get("serial") == state.camera_serial), None)
+    if entry is None:
+        entry = {"serial": state.camera_serial, "connection_types": []}
+        cameras.append(entry)
+    entry["camera_name"] = state.camera_name or entry.get("camera_name", "")
+    entry["model"] = state.camera_model or entry.get("model", "")
+    entry["last_seen"] = datetime.now().isoformat(timespec="seconds")
+    if state.connection_type and state.connection_type not in entry["connection_types"]:
+        entry["connection_types"].append(state.connection_type)
+    CAMERAS_REGISTRY.write_text(json.dumps(cameras, indent=2))
+
+
 def _write_session_file(today_dir: Path, state: AppState) -> None:
     """Write/update a hidden .session.json in today_dir with this camera's info."""
     session_path = today_dir / ".session.json"
@@ -791,6 +1100,7 @@ def _write_session_file(today_dir: Path, state: AppState) -> None:
     }
     if entry not in sessions:
         sessions.append(entry)
+    today_dir.mkdir(parents=True, exist_ok=True)
     session_path.write_text(json.dumps(sessions, indent=2))
 
 
@@ -904,6 +1214,11 @@ async def run_web_server(state: AppState, port: int = 8080) -> None:
     app.router.add_get("/video/{filename}", _video_file_handler)
     app.router.add_get("/clips", lambda r: aiohttp.web.Response(
         text=CLIPS_PAGE, content_type="text/html"))
+    app.router.add_get("/cameras", lambda r: aiohttp.web.Response(
+        text=CAMERAS_PAGE, content_type="text/html"))
+    app.router.add_get("/cameras/list", _cameras_list_handler)
+    app.router.add_delete("/cameras/remove/{serial}", _cameras_remove_handler)
+    app.router.add_delete("/cameras/cooldown/{serial}", _cameras_cooldown_reset_handler)
     app.router.add_get("/dates", _dates_handler)
     app.router.add_get("/clips/videos/{date}", _clips_video_list_handler)
     app.router.add_get("/clips/video/{date}/{filename}", _clips_video_file_handler)
@@ -1170,26 +1485,31 @@ async def run_processor(
 GOPRO_USB_VENDOR_ID = 0x2672
 
 
-def _has_gopro_usb() -> bool:
+async def _has_gopro_usb() -> bool:
+    """Check for a GoPro USB device without blocking the event loop."""
     try:
-        return usb.core.find(idVendor=GOPRO_USB_VENDOR_ID) is not None
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, lambda: usb.core.find(idVendor=GOPRO_USB_VENDOR_ID)
+        )
+        return result is not None
     except Exception as e:
         log.debug("USB check failed: %s", e)
         return False
 
 
-async def wait_for_usb_gopro_disconnect(poll_interval: float = 2.0) -> None:
+async def wait_for_usb_gopro_disconnect(poll_interval: float = 1.0) -> None:
     """Block until no GoPro USB device is present."""
     log.info("Waiting for GoPro to disconnect... (Ctrl+C to stop)")
-    while _has_gopro_usb():
+    while await _has_gopro_usb():
         await asyncio.sleep(poll_interval)
     log.info("GoPro disconnected.")
 
 
-async def wait_for_usb_gopro(poll_interval: float = 2.0) -> None:
+async def wait_for_usb_gopro(poll_interval: float = 0.5) -> None:
     """Block until a GoPro USB device appears."""
     log.info("Waiting for GoPro USB connection... (Ctrl+C to stop)")
-    while not _has_gopro_usb():
+    while not await _has_gopro_usb():
         await asyncio.sleep(poll_interval)
     log.info("GoPro USB device detected.")
 
@@ -1217,15 +1537,255 @@ async def _usb_watchdog(state: AppState, poll_interval: float = 2.0) -> None:
         await asyncio.sleep(poll_interval)
         if state.phase in ("processing", "safe"):
             return
-        if not _has_gopro_usb():
+        if not await _has_gopro_usb():
             raise UnexpectedDisconnect("Camera disconnected during transfer")
+
+
+async def _wireless_watchdog(gopro, state: AppState, poll_interval: float = 2.0) -> None:
+    """Raise UnexpectedDisconnect if BLE connection drops before downloads finish."""
+    while True:
+        await asyncio.sleep(poll_interval)
+        if state.phase in ("processing", "safe"):
+            return
+        if not gopro.is_ble_connected:
+            raise UnexpectedDisconnect("BLE connection lost during transfer")
+
+
+def _usb_serial_hint() -> str | None:
+    """Return a serial to pass to WiredGoPro from the cameras registry.
+
+    If exactly one camera is registered, use its serial so that WiredGoPro can
+    skip the 10-second mDNS discovery and derive the USB IP directly.
+    """
+    try:
+        cameras = json.loads(CAMERAS_REGISTRY.read_text()) if CAMERAS_REGISTRY.exists() else []
+        serials = [c["serial"] for c in cameras if c.get("serial")]
+        if len(serials) == 1:
+            return serials[0]
+    except Exception:
+        pass
+    return None
+
+
+async def _discover_usb() -> tuple:
+    """Loop until a USB GoPro is found and connected. Returns (gopro, False)."""
+    hint = _usb_serial_hint()
+    while True:
+        if not await _has_gopro_usb():
+            await asyncio.sleep(0.5)
+            continue
+        # USB device is present — retry open() until the camera's HTTP stack is ready.
+        for attempt in range(12):
+            try:
+                gopro = WiredGoPro(serial=hint, poll_period=0.5)
+                await gopro.open()
+                return gopro, False
+            except FailedToFindDevice:
+                log.debug("USB device present but not ready (attempt %d/12), retrying...", attempt + 1)
+                await asyncio.sleep(1.0)
+            except Exception as e:
+                log.debug("USB connect error: %s", e)
+                await asyncio.sleep(1.0)
+        # If still not ready after ~12 s, fall back to re-checking USB presence.
+        log.debug("USB open failed after 12 attempts, re-checking device presence.")
+
+
+async def _discover_wireless(state: AppState) -> tuple:
+    """Connect to a GoPro via COHN (Camera on Home Network). Returns (gopro, True).
+
+    Uses BLE to provision COHN on first use (fetches IP, credentials, certificate
+    from the camera and caches them in COHN_DB). Subsequent connections use the
+    cached credentials and connect directly via HTTP — no BLE required after that.
+
+    The camera must have COHN set up (e.g., via the GoPro app) before calling this.
+    """
+    COHN_DB.parent.mkdir(parents=True, exist_ok=True)
+    # open_gopro's WiFi driver checks os.environ["LANG"] even in COHN mode — set en_US once.
+    os.environ.setdefault("LANG", "en_US.UTF-8")
+    if not os.environ["LANG"].startswith("en_US"):
+        os.environ["LANG"] = "en_US.UTF-8"
+    while True:
+        # Before starting a BLE scan, check if all known cameras are still on cooldown.
+        # This avoids connecting to (and disturbing) the camera when there is nothing to do.
+        cooldowns = state.cooldowns
+        if cooldowns and COHN_DB.exists():
+            try:
+                import tinydb as _tdb
+                _db = _tdb.TinyDB(COHN_DB)
+                _records = _db.all()
+                _db.close()
+                if _records:
+                    _known = [r.get("full_serial") for r in _records if r.get("full_serial")]
+                    if _known and all(
+                        cooldowns.get(s) and datetime.now() < cooldowns[s]
+                        for s in _known
+                    ):
+                        _soonest = min(cooldowns[s] for s in _known)
+                        log.debug("All provisioned cameras on cooldown until %s — skipping BLE scan.", _soonest.strftime("%H:%M"))
+                        await asyncio.sleep(30)
+                        continue
+            except Exception:
+                pass
+        try:
+            log.info("Attempting COHN connection (Camera on Home Network)...")
+            # BLE is always required — the SDK uses BLE to identify the camera and look up
+            # its COHN credentials in the DB. COHN-only mode is not supported by the SDK.
+            gopro = WirelessGoPro(
+                target=None,
+                interfaces={WirelessGoPro.Interface.BLE, WirelessGoPro.Interface.COHN},
+                cohn_db=COHN_DB,
+                wifi_adapter=_NoopWifiController,
+            )
+            await gopro.open(timeout=10, retries=2)
+            # Provision COHN if this is the first time (writes credentials to COHN_DB).
+            if not await gopro.cohn.is_configured:
+                log.info("COHN not yet provisioned — running first-time setup via BLE (camera must be on home WiFi)...")
+                result = await gopro.cohn.configure(timeout=90)
+                if isinstance(result, Failure):
+                    log.warning("COHN provisioning failed: %s — retrying in 10 s.", result.failure())
+                    await gopro.close()
+                    await asyncio.sleep(10)
+                    continue
+                log.info("COHN provisioned and credentials saved to %s.", COHN_DB)
+            # Use full serial from HTTP API — matches the key used by main() when storing cooldowns.
+            # gopro.identifier returns only the short BLE name ("6313"), not the full serial.
+            info_resp = await gopro.http_command.get_camera_info()
+            cam_serial = info_resp.data.serial_number if info_resp.ok else gopro.identifier
+            expiry = state.cooldowns.get(cam_serial)
+            if expiry and datetime.now() < expiry:
+                log.info("COHN GoPro %s in cooldown until %s, ignoring.", cam_serial, expiry.strftime("%H:%M"))
+                try:
+                    await gopro.close()
+                except Exception:
+                    pass
+                await asyncio.sleep(30)
+            else:
+                return gopro, True
+        except FailedToFindDevice:
+            log.info("No GoPro found, retrying in 5 s...")
+            await asyncio.sleep(5)
+        except Exception as e:
+            log.warning("COHN connection error: %s — retrying in 5 s.", e)
+            await asyncio.sleep(5)
+
+
+async def _race_discovery(state: AppState) -> tuple:
+    """Race USB and wireless discovery; return (gopro, is_wireless) for the winner."""
+    usb_task = asyncio.create_task(_discover_usb())
+    cohn_task = asyncio.create_task(_discover_wireless(state))
+    done, pending = await asyncio.wait([usb_task, cohn_task], return_when=asyncio.FIRST_COMPLETED)
+    for t in pending:
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+    # If both completed simultaneously, close the extra connection
+    winner = None
+    for t in done:
+        if winner is None:
+            winner = t
+        else:
+            try:
+                extra_gopro, _ = t.result()
+                await extra_gopro.close()
+            except Exception:
+                pass
+    return winner.result()
+
+
+async def _run_session(gopro, is_wireless: bool, state: AppState, today_dir: Path) -> None:
+    """Execute a full transfer session with an already-connected gopro."""
+    state.connection_type = "cohn" if is_wireless else "usb"
+    name_resp = await gopro.http_command.get_camera_name()
+    info_resp = await gopro.http_command.get_camera_info()
+    state.camera_model = (info_resp.data.model_name if info_resp.ok else None)
+    state.camera_name = (name_resp.data if name_resp.ok else None)
+    # Use the full serial from the HTTP API so it is consistent across USB and COHN.
+    # gopro.identifier returns the BLE short name (e.g. "6313") for wireless but
+    # the full serial (e.g. "C3521324526313") for USB, which would break deduplication.
+    state.camera_serial = (info_resp.data.serial_number if info_resp.ok else gopro.identifier)
+    _update_camera_registry(state)
+    push_event(state)
+    _write_session_file(today_dir, state)
+    # Enrich the COHN DB entry with the full serial and camera name obtained via HTTP.
+    # The DB initially only stores the BLE short serial (e.g. "6313").
+    if is_wireless and COHN_DB.exists() and state.camera_serial:
+        import tinydb
+        _db = tinydb.TinyDB(COHN_DB)
+        _db.update(
+            {"full_serial": state.camera_serial, "camera_name": state.camera_name},
+            tinydb.Query().serial.test(lambda s: state.camera_serial.endswith(s)),
+        )
+        _db.close()
+    log.info("Connected: %s (%s) via %s", state.camera_model, state.camera_serial,
+             "COHN" if is_wireless else "USB")
+
+    files = await get_todays_files(gopro, today_dir, state.camera_serial)
+    if not files:
+        log.info("No new video files from today. Nothing to do.")
+        state.phase = "safe"
+        push_event(state)
+        return
+
+    state.phase = "transferring"
+    state.files = [FileEntry(filename=Path(item.filename).name) for item in files]
+    push_event(state)
+    log.info("Starting download + processing (%d file(s))...", len(files))
+
+    queue: asyncio.Queue = asyncio.Queue()
+    watchdog = _wireless_watchdog(gopro, state) if is_wireless else _usb_watchdog(state)
+
+    # Start the processor as a background task so it can work on already-downloaded
+    # files while the next download is in progress.
+    processor_task = asyncio.create_task(
+        run_processor(queue, today_dir, n_workers=N_PROCESS_WORKERS, state=state, today_dir=today_dir, serial=state.camera_serial)
+    )
+    try:
+        try:
+            # Phase 1: download all files (watchdog exits automatically when phase→"processing").
+            await asyncio.gather(
+                run_downloader(gopro, files, queue, RAW_DIR, state),
+                watchdog,
+            )
+        except UnexpectedDisconnect:
+            log.warning("Camera disconnected unexpectedly — aborting and cleaning up raw files.")
+            processor_task.cancel()
+            try:
+                await processor_task
+            except asyncio.CancelledError:
+                pass
+            _cleanup_raw_dir()
+            state.phase = "error"
+            push_event(state)
+            return
+
+        # Downloads complete — camera no longer needed; disconnect now.
+        try:
+            await gopro.close()
+            log.info("Camera disconnected after download. Processing continues in background...")
+        except Exception:
+            pass
+
+        # Phase 2: wait for processing to finish (no camera connection needed).
+        await processor_task
+        state.phase = "safe"
+        push_event(state)
+        log.info("All done. Processed videos: %s", today_dir)
+    except Exception:
+        processor_task.cancel()
+        try:
+            await processor_task
+        except asyncio.CancelledError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-async def main(state: AppState, serial: str | None) -> None:
+async def main(state: AppState, wireless: bool) -> None:
     ensure_dirs()
 
     while True:
@@ -1234,81 +1794,72 @@ async def main(state: AppState, serial: str | None) -> None:
             today_dir.mkdir(parents=True, exist_ok=True)
 
             state.phase = "connecting"
+            state.connection_type = None
             state.camera_serial = None
             state.camera_name = None
             state.camera_model = None
             state.files = []
             refresh_today_stats(state, today_dir)
             push_event(state)
-            log.info("Connecting to GoPro via USB%s...", f" (serial: {serial})" if serial else "")
 
-            async with WiredGoPro(serial=serial) as gopro:
-                state.camera_serial = gopro.identifier
-                name_resp = await gopro.http_command.get_camera_name()
-                info_resp = await gopro.http_command.get_camera_info()
-                state.camera_model = (info_resp.data.model_name if info_resp.ok else None)
-                state.camera_name = (name_resp.data if name_resp.ok else None)
-                push_event(state)
-                _write_session_file(today_dir, state)
-                log.info("Connected: %s (%s)", state.camera_model, state.camera_serial)
-
-                files = await get_todays_files(gopro, today_dir, state.camera_serial)
-                if not files:
-                    log.info("No new video files from today. Nothing to do.")
-                    state.phase = "safe"
-                    push_event(state)
-                else:
-                    state.phase = "transferring"
-                    state.files = [
-                        FileEntry(filename=Path(item.filename).name)
-                        for item in files
-                    ]
-                    push_event(state)
-
-                    log.info("Starting parallel download + processing (%d file(s))...", len(files))
-                    queue: asyncio.Queue = asyncio.Queue()
+            if wireless:
+                log.info("Scanning for GoPro over USB or COHN (Camera on Home Network)...")
+                gopro, is_wireless_conn = await _race_discovery(state)
+                try:
+                    await _run_session(gopro, is_wireless_conn, state, today_dir)
+                finally:
                     try:
-                        await asyncio.gather(
-                            run_downloader(gopro, files, queue, RAW_DIR, state),
-                            run_processor(queue, today_dir, n_workers=N_PROCESS_WORKERS, state=state, today_dir=today_dir, serial=state.camera_serial),
-                            _usb_watchdog(state),
-                        )
-                        state.phase = "safe"
-                        push_event(state)
-                        log.info("All done. Processed videos: %s", today_dir)
-                    except UnexpectedDisconnect:
-                        log.warning("Camera disconnected unexpectedly — aborting and cleaning up raw files.")
-                        _cleanup_raw_dir()
-                        state.phase = "error"
-                        push_event(state)
+                        await gopro.close()
+                    except Exception:
+                        pass
+                    if is_wireless_conn and state.camera_serial:
+                        expiry = datetime.now() + timedelta(hours=COOLDOWN_HOURS)
+                        state.cooldowns[state.camera_serial] = expiry
+                        log.info("Camera %s in cooldown until %s.", state.camera_serial, expiry.strftime("%H:%M"))
+                if not is_wireless_conn:
+                    await wait_for_usb_gopro_disconnect()
+            else:
+                log.info("Connecting to GoPro via USB...")
+                await wait_for_usb_gopro()
+                async with WiredGoPro(serial=_usb_serial_hint(), poll_period=0.5) as gopro:
+                    await _run_session(gopro, False, state, today_dir)
+                await wait_for_usb_gopro_disconnect()
 
-            await wait_for_usb_gopro_disconnect()
             _cleanup_raw_dir()
             state.phase = "waiting"
+            state.connection_type = None
             state.camera_serial = None
             state.camera_name = None
             state.camera_model = None
             state.files = []
             push_event(state)
-            await wait_for_usb_gopro()
+
+            if not wireless:
+                await wait_for_usb_gopro()
+
         except FailedToFindDevice:
-            log.info("Camera not found, waiting for USB connection...")
+            log.info("Camera not found, retrying...")
             state.phase = "waiting"
             push_event(state)
-            await wait_for_usb_gopro()
+            if not wireless:
+                await wait_for_usb_gopro()
         except Exception as e:
             log.error("Unexpected error: %s", e)
             state.phase = "error"
             push_event(state)
-            await wait_for_usb_gopro_disconnect()
-            await wait_for_usb_gopro()
+            _cleanup_raw_dir()
+            if not wireless:
+                await wait_for_usb_gopro_disconnect()
+                await wait_for_usb_gopro()
+            else:
+                await asyncio.sleep(5)
 
 
 async def entrypoint(args: argparse.Namespace) -> None:
     state = AppState()
     server_task = asyncio.create_task(run_web_server(state, port=8080))
     try:
-        await main(state, args.serial)
+        await main(state, args.wireless)
     finally:
         server_task.cancel()
         await asyncio.gather(server_task, return_exceptions=True)
@@ -1317,10 +1868,9 @@ async def entrypoint(args: argparse.Namespace) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download and process today's GoPro videos via USB.")
     parser.add_argument(
-        "--serial",
-        metavar="XXXX",
-        default=None,
-        help="Serial number suffix for the camera (auto-discovers if omitted)",
+        "--wireless",
+        action="store_true",
+        help="Also discover GoPro cameras via COHN (Camera on Home Network). Uses BLE on first use to fetch credentials, then connects directly via HTTP. Requires COHN to be enabled on the camera first (via GoPro app).",
     )
     parser.add_argument(
         "--verbose", "-v",
